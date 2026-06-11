@@ -37,10 +37,15 @@ function RoomPage() {
   const [draft, setDraft] = useState("");
   const [voted, setVoted] = useState<"찬성" | "반대" | null>(null);
   const [voteResult, setVoteResult] = useState<VoteResultPayload | null>(null);
+  const [extensionVoted, setExtensionVoted] = useState(false);
+  const [extensionVotes, setExtensionVotes] = useState(0);
+  const [extensionTotal, setExtensionTotal] = useState(0);
+  const [extensionUsed, setExtensionUsed] = useState(false);
   const [showEnter, setShowEnter] = useState(true);
   const [readyPulse, setReadyPulse] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const hubRef = useRef<HubConnection | null>(null);
+  const sendingRef = useRef(false);
 
   // 입장 오버레이 1.8초 후 자동 제거
   useEffect(() => {
@@ -149,6 +154,17 @@ function RoomPage() {
           setPhase("result");
         });
 
+        hub.on("ExtensionVoteUpdate", ({ votes, total }: { votes: number; total: number }) => {
+          setExtensionVotes(votes);
+          setExtensionTotal(total);
+        });
+
+        hub.on("TimeExtended", ({ extra }: { extra: number }) => {
+          setTimer((t) => t + extra);
+          setExtensionUsed(true);
+          setExtensionVotes(0);
+        });
+
         await hub.start();
         if (cancelled) { hub.stop(); return; }
 
@@ -185,10 +201,34 @@ function RoomPage() {
 
   const me = useMemo(() => players.find((p) => p.isMe), [players]);
 
+  // 현재 유저의 연속 메시지 수 (다른 사람이 보내면 0으로 리셋)
+  const consecutiveCount = useMemo(() => {
+    if (!me) return 0;
+    let count = 0;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].author === me.name) count++;
+      else break;
+    }
+    return count;
+  }, [msgs, me]);
+
   const sendMsg = async () => {
-    if (!draft.trim() || !hubRef.current) return;
-    await hubRef.current.invoke("SendMessage", parseInt(roomId), draft.trim());
-    setDraft("");
+    if (!draft.trim() || !hubRef.current || consecutiveCount >= 3 || sendingRef.current) return;
+    sendingRef.current = true;
+    try {
+      await hubRef.current.invoke("SendMessage", parseInt(roomId), draft.trim());
+      setDraft("");
+    } catch {
+      // 서버측 연속 제한 (동시성 엣지케이스)
+    } finally {
+      sendingRef.current = false;
+    }
+  };
+
+  const handleExtension = async () => {
+    if (extensionVoted || extensionUsed || !hubRef.current) return;
+    setExtensionVoted(true);
+    await hubRef.current.invoke("RequestExtension", parseInt(roomId));
   };
 
   const handleReady = async () => {
@@ -251,6 +291,7 @@ function RoomPage() {
         {(phase === "debate" || phase === "vote") && me && (
           <DebateView
             timer={`${mm}:${ss}`}
+            timerSeconds={timer}
             players={players}
             msgs={msgs}
             draft={draft}
@@ -262,6 +303,12 @@ function RoomPage() {
             voted={voted}
             onVote={handleVote}
             topic={topic}
+            consecutiveCount={consecutiveCount}
+            extensionVoted={extensionVoted}
+            extensionVotes={extensionVotes}
+            extensionTotal={extensionTotal}
+            extensionUsed={extensionUsed}
+            onExtension={handleExtension}
           />
         )}
 
@@ -421,6 +468,7 @@ function RoleRevealOverlay({ role, topic }: { role: "찬성" | "반대"; topic: 
 
 function DebateView({
   timer,
+  timerSeconds,
   players,
   msgs,
   draft,
@@ -432,8 +480,15 @@ function DebateView({
   voted,
   onVote,
   topic,
+  consecutiveCount,
+  extensionVoted,
+  extensionVotes,
+  extensionTotal,
+  extensionUsed,
+  onExtension,
 }: {
   timer: string;
+  timerSeconds: number;
   players: Player[];
   msgs: Message[];
   draft: string;
@@ -445,7 +500,16 @@ function DebateView({
   voted: "찬성" | "반대" | null;
   onVote: (side: "찬성" | "반대") => void;
   topic: string;
+  consecutiveCount: number;
+  extensionVoted: boolean;
+  extensionVotes: number;
+  extensionTotal: number;
+  extensionUsed: boolean;
+  onExtension: () => void;
 }) {
+  const blocked = consecutiveCount >= 3;
+  const showExtension = !voting && timerSeconds > 0 && timerSeconds <= 30 && !extensionUsed;
+
   return (
     <div className="grid lg:grid-cols-[1fr_240px] gap-4 animate-fade-up">
       <div className="flex flex-col bg-surface border border-border rounded-sm overflow-hidden h-[calc(100vh-9rem)]">
@@ -455,12 +519,30 @@ function DebateView({
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">ROUND 1</div>
             <div className="text-sm font-bold tracking-tight">{voting ? "최종 투표" : "자유 토론"}</div>
           </div>
-          <div className="text-right">
-            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">남은 시간</div>
-            <div
-              className={`font-mono text-2xl font-bold tracking-tight ${timer < "00:30" ? "text-destructive animate-pulse" : ""}`}
-            >
-              {timer}
+          <div className="flex items-center gap-3">
+            {showExtension && (
+              <button
+                type="button"
+                onClick={onExtension}
+                disabled={extensionVoted}
+                className={`px-3 py-1.5 rounded-sm font-mono text-[10px] uppercase tracking-widest font-bold transition-colors ${
+                  extensionVoted
+                    ? "bg-accent/20 text-accent border border-accent/40 cursor-default"
+                    : "border border-destructive/50 text-destructive hover:bg-destructive/10"
+                }`}
+              >
+                {extensionVoted
+                  ? `동의 ${extensionVotes}/${extensionTotal}`
+                  : `+60초 연장 (${extensionVotes}/${extensionTotal})`}
+              </button>
+            )}
+            <div className="text-right">
+              <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">남은 시간</div>
+              <div
+                className={`font-mono text-2xl font-bold tracking-tight ${timerSeconds <= 30 && timerSeconds > 0 ? "text-destructive animate-pulse" : ""}`}
+              >
+                {timer}
+              </div>
             </div>
           </div>
         </div>
@@ -514,21 +596,30 @@ function DebateView({
         </div>
 
         {/* Input */}
-        <div className="p-3 border-t border-border bg-surface-elevated flex gap-2">
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMsg()}
-            placeholder={`[${me.role}] 입장에서 발언하세요…`}
-            className="flex-1 h-11 px-4 bg-background border border-border rounded-sm text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:border-accent"
-          />
-          <button
-            type="button"
-            onClick={sendMsg}
-            className="h-11 px-6 bg-foreground text-background font-bold text-xs uppercase tracking-widest rounded-sm hover:bg-accent transition-colors"
-          >
-            전송
-          </button>
+        <div className="border-t border-border bg-surface-elevated">
+          {blocked && (
+            <div className="px-4 py-2 font-mono text-[10px] text-destructive/80 tracking-wide">
+              연속 3개 메시지를 보냈어요. 다른 참가자가 발언하면 다시 보낼 수 있어요.
+            </div>
+          )}
+          <div className="p-3 flex gap-2">
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && !blocked && sendMsg()}
+              placeholder={blocked ? "다른 참가자의 발언을 기다리는 중…" : `[${me.role}] 입장에서 발언하세요…`}
+              disabled={blocked}
+              className="flex-1 h-11 px-4 bg-background border border-border rounded-sm text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:border-accent disabled:opacity-40 disabled:cursor-not-allowed"
+            />
+            <button
+              type="button"
+              onClick={sendMsg}
+              disabled={blocked}
+              className="h-11 px-6 bg-foreground text-background font-bold text-xs uppercase tracking-widest rounded-sm hover:bg-accent transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              전송
+            </button>
+          </div>
         </div>
       </div>
 

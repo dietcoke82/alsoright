@@ -154,6 +154,21 @@ public class GameHub : Hub
         if (!TryGetConnection(roomId, out var info))
             throw new HubException("Not in this room.");
 
+        var state = _gameState.Get(roomId);
+
+        // 연속 3개 초과 차단
+        if (state.LastSenderNickname == info.Nickname)
+        {
+            if (state.ConsecutiveCount >= 3)
+                throw new HubException("CONSECUTIVE_LIMIT");
+            state.ConsecutiveCount++;
+        }
+        else
+        {
+            state.LastSenderNickname = info.Nickname;
+            state.ConsecutiveCount = 1;
+        }
+
         var message = new Message
         {
             RoomId = roomId,
@@ -172,6 +187,33 @@ public class GameHub : Hub
             Content = content,
             T = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
+    }
+
+    // Client requests time extension (requires all players to agree, once per game)
+    public async Task RequestExtension(int roomId)
+    {
+        if (!TryGetConnection(roomId, out var info)) return;
+
+        var state = _gameState.Get(roomId);
+        if (state.Phase != RoomStatus.Debate || state.ExtensionUsed) return;
+
+        state.ExtensionVotes.TryAdd(info.Nickname, 0);
+
+        var uniquePlayers = state.Connections.Values
+            .GroupBy(c => c.Nickname)
+            .Count();
+
+        await Clients.Group(roomId.ToString()).SendAsync("ExtensionVoteUpdate", new
+        {
+            Votes = state.ExtensionVotes.Count,
+            Total = uniquePlayers
+        });
+
+        if (state.ExtensionVotes.Count >= uniquePlayers)
+        {
+            state.ExtensionUsed = true;
+            await Clients.Group(roomId.ToString()).SendAsync("TimeExtended", new { Extra = 60 });
+        }
     }
 
     // Client casts a vote ("찬성" or "반대") during vote phase

@@ -19,6 +19,14 @@ public class RoomGameState
     public RoomStatus Phase { get; set; } = RoomStatus.Waiting;
     public CancellationTokenSource? PhaseCts { get; set; }
     public int MinPlayers { get; set; } = 2;
+
+    // 연속 채팅 제한
+    public string LastSenderNickname { get; set; } = "";
+    public int ConsecutiveCount { get; set; } = 0;
+
+    // 시간 연장 (1회)
+    public ConcurrentDictionary<string, byte> ExtensionVotes { get; } = new();
+    public bool ExtensionUsed { get; set; } = false;
     private int _gameStarted = 0;
 
     public bool TryStartGame()
