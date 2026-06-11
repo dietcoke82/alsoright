@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: alsoright-backend
+spec:
+  selector:
+    app: alsoright-backend
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP

@@ -1,9 +1,11 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ROOMS, getNick, RANDOM_NICKS } from "@/lib/game";
+import type { HubConnection } from "@microsoft/signalr";
+import { fetchRoom, joinRoom, getOrCreateUid, type RoomDetail } from "@/lib/api";
+import { buildHubConnection, type SignalRPlayer, type VoteResultPayload } from "@/lib/signalr";
 
 export const Route = createFileRoute("/room/$roomId")({
-  head: () => ({ meta: [{ title: "토론방 — alsoright" }] }),
+  head: () => ({ meta: [{ title: "토론방 — 니맞내맞" }] }),
   component: RoomPage,
 });
 
@@ -18,111 +20,195 @@ type Player = {
 
 type Message = { author: string; role: "찬성" | "반대"; text: string; t: number };
 
-const SEED_LINES = [
-  { role: "찬성" as const, text: "기본소득은 자동화 시대의 안전망이다." },
-  { role: "반대" as const, text: "재원은 어디서 충당하죠? 증세 없이는 불가능합니다." },
-  { role: "찬성" as const, text: "실업자 보호와 소비 진작이 동시에 가능함." },
-  { role: "반대" as const, text: "근로 의욕 감소가 가장 큰 부작용입니다." },
-  { role: "찬성" as const, text: "핀란드 실험에서 노동 의욕은 감소하지 않았다." },
-  { role: "반대" as const, text: "그 규모와 우리 인구의 차이를 무시한 비교예요." },
-];
-
 function RoomPage() {
   const { roomId } = Route.useParams();
   const nav = useNavigate();
-  const room = ROOMS.find((r) => r.id === roomId) ?? ROOMS[0];
 
-  const [nick, setNickState] = useState<string | null>(null);
-  useEffect(() => {
-    const n = getNick();
-    if (!n) nav({ to: "/nickname" });
-    else setNickState(n);
-  }, [nav]);
-
-  // Players
-  const players: Player[] = useMemo(() => {
-    const others = RANDOM_NICKS.filter((n) => n !== nick).slice(0, 5);
-    const list: Player[] = others.map((name, i) => ({
-      name,
-      role: i % 2 === 0 ? "찬성" : "반대",
-      ready: true,
-    }));
-    list.splice(2, 0, {
-      name: nick ?? "나",
-      role: Math.random() > 0.5 ? "찬성" : "반대",
-      ready: false,
-      isMe: true,
-    });
-    return list;
-  }, [nick]);
-
-  const me = players.find((p) => p.isMe);
+  const [myAlias, setMyAlias] = useState<string>("");
+  const [room, setRoom] = useState<RoomDetail | null>(null);
+  const [myRole, setMyRole] = useState<"찬성" | "반대">("찬성");
 
   const [phase, setPhase] = useState<Phase>("waiting");
+  const [players, setPlayers] = useState<Player[]>([]);
+
   const [meReady, setMeReady] = useState(false);
   const [timer, setTimer] = useState(0);
   const [msgs, setMsgs] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [voted, setVoted] = useState<"찬성" | "반대" | null>(null);
+  const [voteResult, setVoteResult] = useState<VoteResultPayload | null>(null);
+  const [showEnter, setShowEnter] = useState(true);
+  const [readyPulse, setReadyPulse] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const hubRef = useRef<HubConnection | null>(null);
 
-  // Phase machine
+  // 입장 오버레이 1.8초 후 자동 제거
   useEffect(() => {
-    if (phase === "reveal") {
-      const t = setTimeout(() => setPhase("debate"), 3500);
-      return () => clearTimeout(t);
-    }
-    if (phase === "debate") {
-      setTimer(60);
-    }
-    if (phase === "vote") {
-      setTimer(20);
-    }
-  }, [phase]);
+    const t = setTimeout(() => setShowEnter(false), 1800);
+    return () => clearTimeout(t);
+  }, []);
 
-  // Countdown — only runs after timer has been initialized for the phase
+  // Join room and connect to SignalR on mount
+  useEffect(() => {
+    let cancelled = false;
+    let hub: HubConnection | null = null;
+
+    (async () => {
+      try {
+        const roomData = await fetchRoom(roomId);
+        if (cancelled) return;
+
+        if (roomData.phase !== "대기") {
+          nav({ to: "/lobby" });
+          return;
+        }
+
+        setRoom(roomData);
+
+        const uid = getOrCreateUid();
+        const joinData = await joinRoom(roomId, uid);
+        if (cancelled) return;
+
+        const alias = joinData.alias;
+        const role = joinData.role as "찬성" | "반대";
+        setMyAlias(alias);
+        setMyRole(role);
+
+        const dbPlayers: Player[] = roomData.players.map((p) => ({
+          name: p.alias,
+          role: p.role as "찬성" | "반대",
+          ready: p.isReady ?? false,
+          isMe: p.alias === alias,
+        }));
+        if (!dbPlayers.some((p) => p.name === alias)) {
+          dbPlayers.push({ name: alias, role, ready: false, isMe: true });
+        }
+        setPlayers(dbPlayers);
+
+        hub = buildHubConnection();
+        hubRef.current = hub;
+
+        hub.on("UserJoined", ({ alias: a }: { alias: string }) => {
+          setPlayers((prev) => {
+            if (prev.some((p) => p.name === a)) return prev;
+            return [...prev, { name: a, role: "찬성", ready: false, isMe: a === alias }];
+          });
+        });
+
+        hub.on("UserLeft", ({ alias: a }: { alias: string }) => {
+          setPlayers((prev) => prev.filter((p) => p.name !== a));
+        });
+
+        hub.on("PlayerReadyUpdate", ({ alias: a }: { readyCount: number; alias: string }) => {
+          setPlayers((prev) =>
+            prev.map((p) => p.name === a ? { ...p, ready: true } : p)
+          );
+        });
+
+        hub.on("GameStarted", ({ players: serverPlayers }: { players: SignalRPlayer[] }) => {
+          setPlayers(
+            serverPlayers.map((p) => ({
+              name: p.alias,
+              role: p.role as "찬성" | "반대",
+              ready: true,
+              isMe: p.alias === alias,
+            }))
+          );
+          setPhase("reveal");
+          setTimeout(() => {
+            setPhase("debate");
+            setTimer(180);
+          }, 3500);
+        });
+
+        hub.on("PhaseChanged", ({ phase: newPhase }: { phase: string }) => {
+          if (newPhase === "vote") {
+            setPhase("vote");
+            setTimer(30);
+          } else if (newPhase === "result") {
+            setPhase("result");
+          }
+        });
+
+        hub.on("ReceiveMessage", (msg: { author: string; role: string; content: string; t: number }) => {
+          setMsgs((prev) => [
+            ...prev,
+            { author: msg.author, role: msg.role as "찬성" | "반대", text: msg.content, t: msg.t },
+          ]);
+        });
+
+        hub.on("VoteResult", (result: VoteResultPayload) => {
+          setVoteResult(result);
+          const unmaskPlayers = result.players.map((p) => ({
+            name: p.alias,
+            role: p.role as "찬성" | "반대",
+            ready: true,
+            isMe: p.alias === alias,
+          }));
+          setPlayers(unmaskPlayers);
+          setPhase("result");
+        });
+
+        await hub.start();
+        if (cancelled) { hub.stop(); return; }
+
+        await hub.invoke("JoinRoom", parseInt(roomId), alias, role, uid);
+
+        const wasReady = roomData.players.some(p => p.alias === alias && p.isReady);
+        if (wasReady) {
+          setMeReady(true);
+          await hub.invoke("PlayerReady", parseInt(roomId));
+        }
+      } catch (e) {
+        console.error("Failed to connect:", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      hub?.stop();
+    };
+  }, [roomId, nav]);
+
+  // Countdown timer (display only — server drives actual phase transitions)
   useEffect(() => {
     if (phase !== "debate" && phase !== "vote") return;
-    if (timer <= 0) return; // wait for phase-init effect to set timer first
-    const t = setTimeout(() => {
-      setTimer((s) => {
-        const next = s - 1;
-        if (next <= 0) {
-          if (phase === "debate") setPhase("vote");
-          else if (phase === "vote") setPhase("result");
-        }
-        return next;
-      });
-    }, 1000);
+    if (timer <= 0) return;
+    const t = setTimeout(() => setTimer((s) => Math.max(0, s - 1)), 1000);
     return () => clearTimeout(t);
   }, [timer, phase]);
 
-  // Autoplay seed messages during debate
-  useEffect(() => {
-    if (phase !== "debate") return;
-    let i = 0;
-    const tick = setInterval(() => {
-      const line = SEED_LINES[i % SEED_LINES.length];
-      const author =
-        players.find((p) => p.role === line.role && !p.isMe)?.name ?? "참가자";
-      setMsgs((m) => [...m, { ...line, author, t: Date.now() }]);
-      i++;
-    }, 4500);
-    return () => clearInterval(tick);
-  }, [phase, players]);
-
+  // Auto-scroll messages
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [msgs.length]);
 
-  const sendMsg = () => {
-    if (!draft.trim() || !me) return;
-    setMsgs((m) => [...m, { author: me.name, role: me.role, text: draft.trim(), t: Date.now() }]);
+  const me = useMemo(() => players.find((p) => p.isMe), [players]);
+
+  const sendMsg = async () => {
+    if (!draft.trim() || !hubRef.current) return;
+    await hubRef.current.invoke("SendMessage", parseInt(roomId), draft.trim());
     setDraft("");
+  };
+
+  const handleReady = async () => {
+    if (!hubRef.current) return;
+    setMeReady(true);
+    setPlayers((prev) => prev.map((p) => (p.name === myAlias ? { ...p, ready: true, isMe: true } : p)));
+    setReadyPulse(true);
+    setTimeout(() => setReadyPulse(false), 600);
+    await hubRef.current.invoke("PlayerReady", parseInt(roomId));
+  };
+
+  const handleVote = async (side: "찬성" | "반대") => {
+    if (voted || !hubRef.current) return;
+    setVoted(side);
+    await hubRef.current.invoke("CastVote", parseInt(roomId), side);
   };
 
   const mm = String(Math.floor(timer / 60)).padStart(2, "0");
   const ss = String(timer % 60).padStart(2, "0");
+  const topic = room?.topic ?? "토론 주제 로딩 중…";
 
   return (
     <div className="min-h-screen bg-background text-foreground font-sans flex flex-col">
@@ -139,9 +225,9 @@ function RoomPage() {
           </Link>
           <div className="min-w-0 text-center">
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              방 #{room.id}
+              방 #{roomId}
             </div>
-            <div className="text-sm font-bold tracking-tight truncate">{room.topic}</div>
+            <div className="text-sm font-bold tracking-tight truncate">{topic}</div>
           </div>
           <div className="shrink-0 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest">
             <PhaseChip phase={phase} />
@@ -154,16 +240,15 @@ function RoomPage() {
         {phase === "waiting" && (
           <WaitingRoom
             players={players}
-            topic={room.topic}
+            topic={topic}
             ready={meReady}
-            onReady={() => {
-              setMeReady(true);
-              setTimeout(() => setPhase("reveal"), 800);
-            }}
+            onReady={handleReady}
+            pulse={readyPulse}
+            minPlayers={room?.minPlayers ?? 2}
           />
         )}
 
-        {(phase === "debate" || phase === "vote") && (
+        {(phase === "debate" || phase === "vote") && me && (
           <DebateView
             timer={`${mm}:${ss}`}
             players={players}
@@ -171,24 +256,47 @@ function RoomPage() {
             draft={draft}
             setDraft={setDraft}
             sendMsg={sendMsg}
-            me={me!}
+            me={me}
             scrollRef={scrollRef}
             voting={phase === "vote"}
             voted={voted}
-            onVote={(side) => {
-              setVoted(side);
-              setTimeout(() => setPhase("result"), 1200);
-            }}
-            topic={room.topic}
+            onVote={handleVote}
+            topic={topic}
           />
         )}
 
-
-        {phase === "result" && <ResultView players={players} voted={voted} topic={room.topic} />}
+        {phase === "result" && (
+          <ResultView
+            players={players}
+            topic={topic}
+            voteResult={voteResult}
+          />
+        )}
       </div>
 
+      {/* 입장 트리거 오버레이 */}
+      {showEnter && phase === "waiting" && (
+        <div className="fixed inset-0 z-40 pointer-events-none flex items-center justify-center">
+          <div className="animate-fade-up text-center">
+            <div className="font-mono text-[10px] uppercase tracking-[0.4em] text-muted-foreground mb-2">
+              입장 완료
+            </div>
+            <div className="text-2xl font-bold tracking-tight text-accent animate-pulse">
+              {myAlias || "…"}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 준비 완료 pulse ring */}
+      {readyPulse && (
+        <div className="fixed inset-0 z-40 pointer-events-none">
+          <div className="absolute inset-0 border-2 border-pro/60 animate-ping rounded-none" />
+        </div>
+      )}
+
       {/* Overlay: role reveal */}
-      {phase === "reveal" && me && <RoleRevealOverlay role={me.role} topic={room.topic} />}
+      {phase === "reveal" && <RoleRevealOverlay role={myRole} topic={topic} />}
     </div>
   );
 }
@@ -214,31 +322,40 @@ function WaitingRoom({
   topic,
   ready,
   onReady,
+  pulse,
+  minPlayers,
 }: {
   players: Player[];
   topic: string;
   ready: boolean;
   onReady: () => void;
+  pulse?: boolean;
+  minPlayers: number;
 }) {
+  const readyPlayers = players.filter((p) => p.ready);
+
   return (
     <div className="grid lg:grid-cols-[260px_1fr] gap-6 animate-fade-up">
       <aside className="bg-surface border border-border rounded-sm p-4">
         <h3 className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-4">
-          참가자 ({players.length}/10)
+          준비 완료 ({readyPlayers.length}/{minPlayers})
         </h3>
         <ul className="space-y-2">
-          {players.map((p) => (
+          {readyPlayers.map((p) => (
             <li key={p.name} className="flex items-center gap-3">
-              <span className={`size-2 rounded-full ${p.isMe || p.ready ? "bg-pro" : "bg-muted-foreground/40"}`} />
+              <span className="size-2 rounded-full bg-pro" />
               <span className={`text-sm flex-1 ${p.isMe ? "font-bold text-accent" : ""}`}>
                 {p.name} {p.isMe && "(나)"}
               </span>
-              {p.ready && (
-                <span className="font-mono text-[9px] uppercase tracking-widest text-pro">준비</span>
-              )}
+              <span className="font-mono text-[9px] uppercase tracking-widest text-pro">준비</span>
             </li>
           ))}
         </ul>
+        {readyPlayers.length === 0 && (
+          <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground/50 text-center py-4">
+            아직 없음
+          </div>
+        )}
       </aside>
 
       <main className="flex flex-col items-center justify-center min-h-[60vh]">
@@ -253,7 +370,7 @@ function WaitingRoom({
             {topic}
           </h2>
           <p className="mt-6 text-sm text-muted-foreground">
-            준비 완료를 누르면 입장이 무작위로 배정됩니다.
+            준비 완료를 누르면 {minPlayers}명 이상 준비 시 자동으로 시작됩니다.
           </p>
         </div>
 
@@ -261,10 +378,12 @@ function WaitingRoom({
           type="button"
           disabled={ready}
           onClick={onReady}
-          className={`mt-10 px-12 py-4 rounded-sm font-bold tracking-widest text-sm uppercase transition-colors ${
+          className={`mt-10 px-12 py-4 rounded-sm font-bold tracking-widest text-sm uppercase transition-all duration-200 ${
             ready
-              ? "bg-pro/20 text-pro border border-pro/40"
-              : "bg-foreground text-background hover:bg-accent"
+              ? "bg-pro/20 text-pro border border-pro/40 scale-95"
+              : pulse
+              ? "bg-accent text-background scale-95"
+              : "bg-foreground text-background hover:bg-accent active:scale-95"
           }`}
         >
           {ready ? "✓ 준비 완료" : "준비 완료"}
@@ -276,13 +395,12 @@ function WaitingRoom({
 
 function RoleRevealOverlay({ role, topic }: { role: "찬성" | "반대"; topic: string }) {
   const color = role === "찬성" ? "text-pro border-pro/50" : "text-con border-con/50";
-  const sub =
-    role === "찬성"
-      ? "이 주장을 옹호하세요"
-      : "이 주장을 반박하세요";
+  const sub = role === "찬성" ? "이 주장을 옹호하세요" : "이 주장을 반박하세요";
   return (
     <div className="fixed inset-0 z-50 bg-background/95 backdrop-blur-sm grid place-items-center animate-fade-up">
-      <div className={`relative max-w-md w-[90%] aspect-[3/4] border-2 rounded-lg ${color} bg-surface-elevated p-8 flex flex-col items-center justify-center text-center shadow-2xl`}>
+      <div
+        className={`relative max-w-md w-[90%] aspect-[3/4] border-2 rounded-lg ${color} bg-surface-elevated p-8 flex flex-col items-center justify-center text-center shadow-2xl`}
+      >
         <div className="absolute top-4 left-4 right-4 flex justify-between font-mono text-[10px] uppercase tracking-widest opacity-60">
           <span>ROLE</span>
           <span>CARD</span>
@@ -290,15 +408,9 @@ function RoleRevealOverlay({ role, topic }: { role: "찬성" | "반대"; topic: 
         <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-muted-foreground mb-4">
           ━ 당신의 역할 ━
         </div>
-        <div className={`text-7xl font-bold tracking-tighter mb-6 ${color.split(" ")[0]}`}>
-          {role}
-        </div>
-        <div className="text-xs uppercase tracking-widest text-muted-foreground mb-3">
-          {sub}
-        </div>
-        <p className="text-lg font-bold leading-snug text-foreground">
-          "{topic}"
-        </p>
+        <div className={`text-7xl font-bold tracking-tighter mb-6 ${color.split(" ")[0]}`}>{role}</div>
+        <div className="text-xs uppercase tracking-widest text-muted-foreground mb-3">{sub}</div>
+        <p className="text-lg font-bold leading-snug text-foreground">"{topic}"</p>
         <div className="absolute bottom-4 left-4 right-4 text-center font-mono text-[10px] uppercase tracking-widest text-muted-foreground animate-pulse">
           잠시 후 토론이 시작됩니다…
         </div>
@@ -340,18 +452,14 @@ function DebateView({
         {/* Round bar */}
         <div className="px-5 py-3 border-b border-border bg-surface-elevated flex items-center justify-between">
           <div>
-            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              ROUND 1
-            </div>
-            <div className="text-sm font-bold tracking-tight">
-              {voting ? "최종 투표" : "자유 토론"}
-            </div>
+            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">ROUND 1</div>
+            <div className="text-sm font-bold tracking-tight">{voting ? "최종 투표" : "자유 토론"}</div>
           </div>
           <div className="text-right">
-            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-              남은 시간
-            </div>
-            <div className={`font-mono text-2xl font-bold tracking-tight ${timer < "00:30" ? "text-destructive animate-pulse" : ""}`}>
+            <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">남은 시간</div>
+            <div
+              className={`font-mono text-2xl font-bold tracking-tight ${timer < "00:30" ? "text-destructive animate-pulse" : ""}`}
+            >
               {timer}
             </div>
           </div>
@@ -360,14 +468,11 @@ function DebateView({
         {/* AI host banner */}
         <div className="px-5 py-2.5 border-b border-border bg-accent/5 flex items-center gap-2">
           <span className="text-base">🤖</span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-accent">
-            사회자
-          </span>
+          <span className="font-mono text-[10px] uppercase tracking-widest text-accent">사회자</span>
           <span className="text-xs text-foreground/80">
             {voting ? "토론 종료! 투표가 진행 중입니다." : "상대 주장에 반론을 제시하세요."}
           </span>
         </div>
-
 
         {/* Messages */}
         <div
@@ -435,25 +540,19 @@ function DebateView({
         <ul className="space-y-2.5">
           {players.map((p) => (
             <li key={p.name} className="flex items-center gap-2">
-              <span className="size-2 bg-pro rounded-full animate-pulse-dot" />
+              <span className={`size-2 rounded-full animate-pulse-dot ${p.role === "찬성" ? "bg-pro" : "bg-con"}`} />
               <span className={`text-xs flex-1 ${p.isMe ? "font-bold text-accent" : ""}`}>
                 {p.name} {p.isMe && "(나)"}
               </span>
-              <span className="font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
-                ?
+              <span className={`font-mono text-[9px] uppercase tracking-widest ${p.role === "찬성" ? "text-pro" : "text-con"}`}>
+                {p.role}
               </span>
             </li>
           ))}
         </ul>
-        <div className="mt-5 pt-4 border-t border-border">
-          <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground mb-2">
-            투표
-          </div>
-          <div className="text-xs text-foreground/70">라운드 종료 후 공개</div>
-        </div>
       </aside>
 
-      {/* Vote overlay: takes over screen when debate timer hits 0 */}
+      {/* Vote overlay */}
       {voting && (
         <div className="fixed inset-0 z-50 bg-background/80 backdrop-blur-md flex items-center justify-center p-6 animate-fade-up">
           <VoteBanner topic={topic} voted={voted} onVote={onVote} />
@@ -482,9 +581,7 @@ function VoteBanner({
         <div className="font-mono text-xs uppercase tracking-[0.3em] text-accent font-bold mb-3">
           ━ 투표 시간 ━
         </div>
-        <div className="text-2xl sm:text-3xl font-bold tracking-tight leading-snug">
-          "{topic}"
-        </div>
+        <div className="text-2xl sm:text-3xl font-bold tracking-tight leading-snug">"{topic}"</div>
         <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground mt-3">
           가장 설득력 있던 입장에 한 표를 던지세요
         </div>
@@ -516,120 +613,25 @@ function VoteBanner({
   );
 }
 
-function VoteView({
-
-  voted,
-  onVote,
-  timer,
-  topic,
-}: {
-  voted: "찬성" | "반대" | null;
-  onVote: (side: "찬성" | "반대") => void;
-  timer: string;
-  topic: string;
-}) {
-  const sides: Array<{
-    key: "찬성" | "반대";
-    sub: string;
-    selectedCls: string;
-    textCls: string;
-    badgeCls: string;
-  }> = [
-    {
-      key: "찬성",
-      sub: "이 주장에 동의합니다",
-      selectedCls: "border-pro bg-pro/10 scale-105 shadow-2xl",
-      textCls: "text-pro",
-      badgeCls: "bg-pro text-background",
-    },
-    {
-      key: "반대",
-      sub: "이 주장에 반대합니다",
-      selectedCls: "border-con bg-con/10 scale-105 shadow-2xl",
-      textCls: "text-con",
-      badgeCls: "bg-con text-background",
-    },
-  ];
-  return (
-    <div className="max-w-3xl mx-auto py-10 animate-fade-up">
-      <div className="text-center mb-10">
-        <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-muted-foreground mb-3">
-          ━ 토론 종료 · 최종 투표 ━
-        </div>
-        <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-balance">
-          "{topic}"
-        </h2>
-        <p className="mt-3 text-sm text-muted-foreground">
-          토론을 듣고 당신의 <span className="text-accent italic">진짜 입장</span>을 선택하세요
-        </p>
-        <div className="mt-4 font-mono text-2xl font-bold text-destructive animate-pulse">
-          {timer}
-        </div>
-      </div>
-
-      <div className="grid sm:grid-cols-2 gap-4">
-        {sides.map((s) => {
-          const selected = voted === s.key;
-          const dim = voted && !selected;
-          return (
-            <button
-              key={s.key}
-              type="button"
-              onClick={() => onVote(s.key)}
-              className={`aspect-[4/5] rounded-lg border-2 p-8 flex flex-col items-center justify-center text-center transition-all ${
-                selected
-                  ? s.selectedCls
-                  : dim
-                    ? "border-border bg-surface opacity-40 hover:opacity-70"
-                    : "border-border bg-surface hover:border-foreground/40 hover:-translate-y-1"
-              }`}
-            >
-              <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-muted-foreground mb-4">
-                VOTE
-              </div>
-              <div className={`text-6xl sm:text-7xl font-bold tracking-tighter mb-4 ${s.textCls}`}>
-                {s.key}
-              </div>
-              <div className="text-sm text-muted-foreground">{s.sub}</div>
-              {selected && (
-                <div className={`mt-6 px-3 py-1 rounded-full font-mono text-[10px] uppercase tracking-widest font-bold ${s.badgeCls}`}>
-                  ✓ 투표 완료
-                </div>
-              )}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
 function ResultView({
   players,
-  voted,
   topic,
+  voteResult,
 }: {
   players: Player[];
-  voted: "찬성" | "반대" | null;
   topic: string;
+  voteResult: VoteResultPayload | null;
 }) {
-  // Simulated full vote tally — counts other players' "votes" plus my own
-  const otherVotes = useMemo(() => {
-    return players
-      .filter((p) => !p.isMe)
-      .map((p) => (((p.name.charCodeAt(0) + p.name.length) % 2 === 0) ? "찬성" : "반대") as "찬성" | "반대");
-  }, [players]);
-  const allVotes = voted ? [...otherVotes, voted] : otherVotes;
-  const pro = allVotes.filter((v) => v === "찬성").length;
-  const con = allVotes.filter((v) => v === "반대").length;
+  const pro = voteResult?.pro ?? 0;
+  const con = voteResult?.con ?? 0;
   const total = Math.max(pro + con, 1);
   const proPct = Math.round((pro / total) * 100);
   const conPct = 100 - proPct;
-  const winner = pro === con ? "무승부" : pro > con ? "찬성" : "반대";
+  const winner = voteResult?.winner ?? "집계 중";
 
   return (
     <div className="max-w-4xl mx-auto py-10 animate-fade-up">
-      {/* Top: Vote result */}
+      {/* Vote result */}
       <div className="bg-surface-elevated border border-border rounded-lg p-6 sm:p-8 mb-10 shadow-2xl">
         <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-muted-foreground mb-2 text-center">
           ━ 최종 투표 결과 ━
@@ -639,7 +641,11 @@ function ResultView({
         </h2>
         <div className="text-center mb-6">
           <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">승자 · </span>
-          <span className={`font-bold tracking-tight ${winner === "찬성" ? "text-pro" : winner === "반대" ? "text-con" : "text-foreground"}`}>
+          <span
+            className={`font-bold tracking-tight ${
+              winner === "찬성" ? "text-pro" : winner === "반대" ? "text-con" : "text-foreground"
+            }`}
+          >
             {winner}
           </span>
         </div>
@@ -697,25 +703,14 @@ function ResultView({
             <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
               맡은 역할
             </div>
-            <div
-              className={`text-3xl font-bold tracking-tighter ${
-                p.role === "찬성" ? "text-pro" : "text-con"
-              }`}
-            >
+            <div className={`text-3xl font-bold tracking-tighter ${p.role === "찬성" ? "text-pro" : "text-con"}`}>
               {p.role}
             </div>
           </div>
         ))}
       </div>
 
-      <div className="mt-12 flex flex-col sm:flex-row gap-3 justify-center">
-        <button
-          type="button"
-          onClick={() => window.location.reload()}
-          className="px-8 py-3 bg-foreground text-background rounded-sm font-bold text-xs tracking-widest uppercase hover:bg-accent transition-colors"
-        >
-          다음 라운드 →
-        </button>
+      <div className="mt-12 flex justify-center">
         <Link
           to="/lobby"
           className="px-8 py-3 border border-border rounded-sm font-bold text-xs tracking-widest uppercase hover:border-foreground transition-colors text-center"

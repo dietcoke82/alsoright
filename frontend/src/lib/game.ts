@@ -48,12 +48,24 @@ export const FLOATING_OPINIONS = [
 ];
 
 const NICK_KEY = "alsoright:nick";
+const SESSION_KEY = "alsoright:sessionId";
+
 export function getNick(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem(NICK_KEY);
 }
 export function setNick(n: string) {
   if (typeof window !== "undefined") localStorage.setItem(NICK_KEY, n);
+}
+
+export function getSessionId(): string {
+  if (typeof window === "undefined") return "";
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
 }
 
 export function randomNick() {

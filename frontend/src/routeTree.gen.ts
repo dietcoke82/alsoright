@@ -9,16 +9,10 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as NicknameRouteImport } from './routes/nickname'
 import { Route as LobbyRouteImport } from './routes/lobby'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as RoomRoomIdRouteImport } from './routes/room.$roomId'
 
-const NicknameRoute = NicknameRouteImport.update({
-  id: '/nickname',
-  path: '/nickname',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const LobbyRoute = LobbyRouteImport.update({
   id: '/lobby',
   path: '/lobby',
@@ -38,46 +32,35 @@ const RoomRoomIdRoute = RoomRoomIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/lobby': typeof LobbyRoute
-  '/nickname': typeof NicknameRoute
   '/room/$roomId': typeof RoomRoomIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/lobby': typeof LobbyRoute
-  '/nickname': typeof NicknameRoute
   '/room/$roomId': typeof RoomRoomIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/lobby': typeof LobbyRoute
-  '/nickname': typeof NicknameRoute
   '/room/$roomId': typeof RoomRoomIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/lobby' | '/nickname' | '/room/$roomId'
+  fullPaths: '/' | '/lobby' | '/room/$roomId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/lobby' | '/nickname' | '/room/$roomId'
-  id: '__root__' | '/' | '/lobby' | '/nickname' | '/room/$roomId'
+  to: '/' | '/lobby' | '/room/$roomId'
+  id: '__root__' | '/' | '/lobby' | '/room/$roomId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LobbyRoute: typeof LobbyRoute
-  NicknameRoute: typeof NicknameRoute
   RoomRoomIdRoute: typeof RoomRoomIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/nickname': {
-      id: '/nickname'
-      path: '/nickname'
-      fullPath: '/nickname'
-      preLoaderRoute: typeof NicknameRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/lobby': {
       id: '/lobby'
       path: '/lobby'
@@ -105,7 +88,6 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   LobbyRoute: LobbyRoute,
-  NicknameRoute: NicknameRoute,
   RoomRoomIdRoute: RoomRoomIdRoute,
 }
 export const routeTree = rootRouteImport

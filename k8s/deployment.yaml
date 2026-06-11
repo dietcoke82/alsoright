@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alsoright-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: alsoright-backend
+  template:
+    metadata:
+      labels:
+        app: alsoright-backend
+    spec:
+      containers:
+        - name: backend
+          image: alsoright/backend:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: DatabaseProvider
+              value: "SqlServer"
+            - name: ConnectionStrings__DefaultConnection
+              value: "Server=sql-server;Database=alsoright;User Id=sa;Password=Your_password123;"
+            - name: Kafka__BootstrapServers
+              value: "kafka:9092"
